@@ -1,6 +1,4 @@
 defmodule Aoc.Day06 do
-  alias Hex.Solver.Constraints.Empty
-
   def part1(args) do
     args
     |> clean_input()
