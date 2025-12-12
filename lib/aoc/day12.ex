@@ -1,13 +1,19 @@
 defmodule Aoc.Day12 do
+  @max_visits 1_000_000
+
   def part1(args) do
     %{shapes: shapes, regions: regions} =
       args
       |> clean_input()
 
+    # Parallel processing for significant speedup
     regions
-    |> Enum.count(fn region ->
-      can_fit_presents?(region, shapes)
-    end)
+    |> Task.async_stream(
+      fn region -> can_fit_presents?(region, shapes) end,
+      max_concurrency: System.schedulers_online(),
+      timeout: :infinity
+    )
+    |> Enum.count(fn {:ok, result} -> result end)
   end
 
   def part2(args) do
@@ -85,7 +91,10 @@ defmodule Aoc.Day12 do
         List.duplicate(shape_idx, count)
       end)
 
-    %{width: width, height: height, shapes: shapes}
+    # Pre-compute bounding box for faster bounds checking
+    bounds_tuple = {0, width - 1, 0, height - 1}
+
+    %{width: width, height: height, shapes: shapes, bounds_tuple: bounds_tuple}
   end
 
   # Check if all presents can fit in the region
@@ -111,112 +120,97 @@ defmodule Aoc.Day12 do
           get_all_orientations(shape)
         end)
 
-      # Try to place all presents using backtracking with a visit limit
-      {result, _visits} = place_presents(shapes_with_orientations, region, MapSet.new(), 0, 1_000_000)
+      # Initialize visit counter in process dictionary
+      Process.put(:visits, 0)
+
+      # Try to place all presents using backtracking
+      result = place_presents(shapes_with_orientations, region, MapSet.new())
+
+      # Clean up process dictionary
+      Process.delete(:visits)
+
       result
     end
   end
 
   # Backtracking algorithm to place all presents
-  defp place_presents([], _region, _occupied, visits, _max_visits), do: {true, visits}
+  defp place_presents([], _region, _occupied), do: true
 
-  defp place_presents(_shapes, _region, _occupied, visits, max_visits) when visits > max_visits do
-    {false, visits}
-  end
+  defp place_presents([orientations | rest], region, occupied) do
+    # Check visit limit using process dictionary
+    visits = Process.get(:visits, 0)
 
-  defp place_presents([orientations | rest], region, occupied, visits, max_visits) do
-    # Get candidate positions (reduce search space)
-    candidate_positions = get_smart_positions(region, occupied)
+    if visits > @max_visits do
+      false
+    else
+      # Increment visit counter
+      Process.put(:visits, visits + 1)
 
-    # Try all orientations
-    result =
-      Enum.reduce_while(orientations, {false, visits}, fn oriented_shape, {_found, visit_count} ->
+      # Get candidate positions (reduce search space)
+      candidate_positions = get_smart_positions(region, occupied)
+
+      # Try all orientations
+      Enum.any?(orientations, fn oriented_shape ->
         # Try candidate positions only
-        pos_result =
-          Enum.reduce_while(candidate_positions, {false, visit_count}, fn {x, y}, {_found, vc} ->
-            placed_coords = translate_shape(oriented_shape, x, y)
+        Enum.any?(candidate_positions, fn {x, y} ->
+          placed_coords = translate_shape(oriented_shape, x, y)
 
-            if can_place?(placed_coords, region, occupied) do
-              # Place it and try to place the rest
-              new_occupied = MapSet.union(occupied, placed_coords)
-              {success, new_visits} = place_presents(rest, region, new_occupied, vc + 1, max_visits)
-
-              if success do
-                {:halt, {true, new_visits}}
-              else
-                {:cont, {false, new_visits}}
-              end
-            else
-              {:cont, {false, vc + 1}}
-            end
-          end)
-
-        case pos_result do
-          {true, v} -> {:halt, {true, v}}
-          {false, v} -> {:cont, {false, v}}
-        end
+          if can_place?(placed_coords, region, occupied) do
+            # Place it and try to place the rest
+            new_occupied = MapSet.union(occupied, placed_coords)
+            place_presents(rest, region, new_occupied)
+          else
+            false
+          end
+        end)
       end)
-
-    result
+    end
   end
+
+  # Directions for 8-way adjacency
+  @directions [{-1, -1}, {-1, 0}, {-1, 1}, {0, -1}, {0, 1}, {1, -1}, {1, 0}, {1, 1}]
 
   # Get smart positions to try - positions adjacent to occupied cells
   defp get_smart_positions(region, occupied) do
     if MapSet.size(occupied) == 0 do
-      # First shape: try origin and a few other positions
+      # First shape: try origin only
       [{0, 0}]
     else
-      # Get all empty cells adjacent to occupied cells
-      occupied
-      |> Enum.flat_map(fn {x, y} ->
-        [
-          {x - 1, y - 1}, {x, y - 1}, {x + 1, y - 1},
-          {x - 1, y}, {x + 1, y},
-          {x - 1, y + 1}, {x, y + 1}, {x + 1, y + 1}
-        ]
-      end)
-      |> Enum.filter(fn {x, y} ->
-        x >= 0 and x < region.width and y >= 0 and y < region.height and
-          not MapSet.member?(occupied, {x, y})
-      end)
-      |> Enum.uniq()
-      |> Enum.sort()
+      # Use comprehension for efficiency - single pass instead of flat_map
+      candidates =
+        for {x, y} <- occupied,
+            {dx, dy} <- @directions,
+            nx = x + dx,
+            ny = y + dy,
+            nx >= 0 and nx < region.width and ny >= 0 and ny < region.height,
+            not MapSet.member?(occupied, {nx, ny}),
+            do: {nx, ny}
+
+      candidates |> Enum.uniq() |> Enum.sort()
     end
   end
 
   # Generate all 8 possible orientations (4 rotations × 2 flips)
   defp get_all_orientations(shape) do
-    rotations = [
-      shape,
-      rotate_90(shape),
-      rotate_180(shape),
-      rotate_270(shape)
-    ]
+    # Pre-compute rotations to avoid redundant rotate_90 calls
+    r90 = rotate_90(shape)
+    r180 = rotate_90(r90)
+    r270 = rotate_90(r180)
+    flipped = flip_horizontal(shape)
+    f90 = rotate_90(flipped)
+    f180 = rotate_90(f90)
+    f270 = rotate_90(f180)
 
-    flipped_rotations = Enum.map(rotations, &flip_horizontal/1)
-
-    (rotations ++ flipped_rotations)
-    |> Enum.uniq()
+    # Use MapSet for O(n) deduplication instead of Enum.uniq O(n²)
+    [shape, r90, r180, r270, flipped, f90, f180, f270]
+    |> MapSet.new()
+    |> MapSet.to_list()
   end
 
   # Rotate 90 degrees clockwise: (x, y) -> (y, -x)
   defp rotate_90(shape) do
     shape
     |> Enum.map(fn {x, y} -> {y, -x} end)
-    |> normalize_shape()
-  end
-
-  # Rotate 180 degrees: (x, y) -> (-x, -y)
-  defp rotate_180(shape) do
-    shape
-    |> Enum.map(fn {x, y} -> {-x, -y} end)
-    |> normalize_shape()
-  end
-
-  # Rotate 270 degrees clockwise: (x, y) -> (-y, x)
-  defp rotate_270(shape) do
-    shape
-    |> Enum.map(fn {x, y} -> {-y, x} end)
     |> normalize_shape()
   end
 
@@ -240,16 +234,17 @@ defmodule Aoc.Day12 do
 
   # Translate shape to position (dx, dy)
   defp translate_shape(shape, dx, dy) do
-    shape
-    |> Enum.map(fn {x, y} -> {x + dx, y + dy} end)
-    |> MapSet.new()
+    # Single-pass transformation using Enum.into
+    Enum.into(shape, MapSet.new(), fn {x, y} -> {x + dx, y + dy} end)
   end
 
   # Check if a shape can be placed at the given coordinates
   defp can_place?(coords, region, occupied) do
+    {min_x, max_x, min_y, max_y} = region.bounds_tuple
+
     Enum.all?(coords, fn {x, y} ->
-      # Must be within bounds
-      x >= 0 and x < region.width and y >= 0 and y < region.height and
+      # Must be within bounds (using pre-computed bounds_tuple)
+      x >= min_x and x <= max_x and y >= min_y and y <= max_y and
         # Must not overlap with already placed presents
         not MapSet.member?(occupied, {x, y})
     end)
